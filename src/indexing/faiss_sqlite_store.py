@@ -87,7 +87,13 @@ class FAISSSQLiteStore(IndexStore):
         self._chunk_ids = []
         self._started = time.time()
 
-        self._index_dir(index_name).mkdir(parents=True, exist_ok=True)
+        # Повторная сборка с тем же именем перезаписывает старый индекс целиком.
+        index_dir = self._index_dir(index_name)
+        if index_dir.exists():
+            print(f"Индекс '{index_name}' уже существует — перезаписываю (удаляю старую версию).")
+            shutil.rmtree(index_dir)
+
+        index_dir.mkdir(parents=True, exist_ok=True)
         self._open_db()
         self._create_tables()
 
