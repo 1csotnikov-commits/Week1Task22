@@ -13,6 +13,12 @@ data/index/*
 *.npy
 *.db
 
+# Результаты оценки и логи RAG
+data/eval/results/*
+!data/eval/results/.gitkeep
+data/logs/*
+!data/logs/.gitkeep
+
 # Отчёты
 *.report.json
 *.report.csv

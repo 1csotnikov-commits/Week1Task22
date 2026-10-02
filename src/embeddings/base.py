@@ -7,6 +7,16 @@ from typing import List, Optional
 
 import numpy as np
 
+# Префиксы для модели nomic-embed-text-v2-moe.
+# Модель различает типы задач: при индексации к тексту документа добавляется
+# search_document:, при поиске к запросу — search_query:.
+SEARCH_DOCUMENT_PREFIX = "search_document: "
+SEARCH_QUERY_PREFIX = "search_query: "
+
+# Маркер формата эмбеддингов, сохраняемый в индексе.
+# Позволяет обнаружить старые индексы (созданные без префиксов) и предложить переиндексацию.
+EMBEDDING_FORMAT_VERSION = "nomic-search-doc-v1"
+
 
 class EmbeddingProvider(ABC):
     """Интерфейс генератора эмбеддингов.

@@ -11,13 +11,23 @@ from typing import List, Optional, Tuple
 
 from src.cli.commands import (
     FORMAT_CHOICES,
+    REPORT_FORMAT_CHOICES,
     STRATEGY_CHOICES,
     build_help,
     list_index_subcommands,
 )
 from src.config import Config
+from src.embeddings.nomic_provider import NomicProvider
+from src.evaluation.generator import generate_questions
+from src.evaluation.questions import load_questions, save_questions
+from src.evaluation.report import render_report, render_report_file
+from src.evaluation.runner import run_evaluation, save_results
 from src.indexing.faiss_sqlite_store import FAISSSQLiteStore
 from src.indexing.pipeline import build_index
+from src.llm.deepseek_provider import DeepSeekProvider
+from src.rag.no_rag_pipeline import NoRAGPipeline
+from src.rag.pipeline import RAGPipeline
+from src.retrieval.vector_retriever import VectorRetriever
 from src.stats.chunk_stats import compute_stats, render, render_compare
 
 BANNER = "Пайплайн индексации документов. Введите /help для списка команд, /exit для выхода."
@@ -255,6 +265,192 @@ def _cmd_delete(app: App, index_name: str) -> str:
 
 
 # ---------------------------------------------------------------------- #
+# Вспомогательные фабрики (Dependency Injection)
+# ---------------------------------------------------------------------- #
+def _make_llm(config: Config) -> DeepSeekProvider:
+    provider = config.get("llm.provider", "deepseek")
+    if provider != "deepseek":
+        raise ValueError(f"Неизвестный LLM-провайдер: {provider!r}. Доступен только 'deepseek'.")
+    return DeepSeekProvider(
+        model=config.get("llm.model", "deepseek-chat"),
+        base_url=config.get("llm.base_url", "https://api.deepseek.com"),
+        temperature=float(config.get("llm.temperature", 0.3)),
+        max_tokens=int(config.get("llm.max_tokens", 1024)),
+        timeout=float(config.get("llm.timeout", 60.0)),
+    )
+
+
+def _make_embedder(config: Config) -> NomicProvider:
+    return NomicProvider(
+        model_name=config.embedding_model,
+        device=config.get("embedding.device", "cpu"),
+        batch_size=config.embedding_batch_size,
+        trust_remote_code=bool(config.get("embedding.trust_remote_code", True)),
+    )
+
+
+def _make_retriever(app: App, index_name: str) -> VectorRetriever:
+    return VectorRetriever(store=app.store, embedder=_make_embedder(app.config), index_name=index_name)
+
+
+def _resolve_index(config: Config, flags: dict) -> str:
+    index = flags.get("index") or config.get("rag.default_index", "")
+    if not index:
+        raise ValueError("Не указан индекс. Укажите --index <index_name> или задайте rag.default_index в config.yaml.")
+    return index
+
+
+def _render_questions_short(questions) -> str:
+    lines = []
+    for q in questions:
+        lines.append(f"  {q.id}: {q.question}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------- #
+# Команды /ask, /ask-raw, /ask-compare
+# ---------------------------------------------------------------------- #
+def _cmd_ask(app: App, args: List[str]) -> str:
+    pos, flags = parse_args(args)
+    _require_positional(pos, 1, "/ask \"<вопрос>\" [--index <index_name>] [--top-k N]")
+    question = pos[0]
+    index_name = _resolve_index(app.config, flags)
+    top_k = int(flags["top-k"]) if flags.get("top-k") else None
+    debug = bool(flags.get("debug")) or app.debug
+
+    pipeline = RAGPipeline(_make_retriever(app, index_name), _make_llm(app.config), app.config)
+    result = pipeline.run(question, top_k=top_k)
+
+    lines = ["--- Ответ (RAG) ---", result.answer, "", "--- Источники ---"]
+    if not result.used_chunks:
+        lines.append("  (чанки не найдены)")
+    for c in result.used_chunks:
+        lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+    if debug:
+        lines.append("")
+        lines.append("--- Полный промт ---")
+        lines.append(result.prompt)
+        lines.append("")
+        lines.append("--- Все использованные чанки ---")
+        for c in result.used_chunks:
+            lines.append(f"\n[{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id}")
+            lines.append(c.text)
+    return "\n".join(lines)
+
+
+def _cmd_ask_raw(app: App, args: List[str]) -> str:
+    pos, flags = parse_args(args)
+    _require_positional(pos, 1, "/ask-raw \"<вопрос>\" [--debug]")
+    question = pos[0]
+    debug = bool(flags.get("debug")) or app.debug
+
+    pipeline = NoRAGPipeline(_make_llm(app.config), app.config)
+    result = pipeline.run(question)
+
+    lines = ["--- Ответ (No-RAG) ---", result.answer]
+    if debug:
+        lines.append("")
+        lines.append("--- Полный промт ---")
+        lines.append(result.prompt)
+    return "\n".join(lines)
+
+
+def _cmd_ask_compare(app: App, args: List[str]) -> str:
+    pos, flags = parse_args(args)
+    _require_positional(pos, 1, "/ask-compare \"<вопрос>\" [--index <index_name>] [--top-k N]")
+    question = pos[0]
+    index_name = _resolve_index(app.config, flags)
+    top_k = int(flags["top-k"]) if flags.get("top-k") else None
+
+    llm = _make_llm(app.config)
+    rag = RAGPipeline(_make_retriever(app, index_name), llm, app.config).run(question, top_k=top_k)
+    no_rag = NoRAGPipeline(llm, app.config).run(question)
+
+    lines = [f"===== Сравнение ответов =====", "", f"Вопрос: {question}", ""]
+    lines.append("--- Ответ без RAG ---")
+    lines.append(no_rag.answer)
+    lines.append("")
+    lines.append("--- Ответ с RAG ---")
+    lines.append(rag.answer)
+    lines.append("")
+    lines.append("--- Источники (RAG) ---")
+    if not rag.used_chunks:
+        lines.append("  (чанки не найдены)")
+    for c in rag.used_chunks:
+        lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------- #
+# Команды /eval
+# ---------------------------------------------------------------------- #
+def _cmd_eval(app: App, args: List[str]) -> str:
+    if not args:
+        return build_help("/eval")
+    sub = args[0]
+    rest = args[1:]
+    if sub == "generate":
+        return _cmd_eval_generate(app, rest)
+    if sub == "run":
+        _require_positional(rest, 1, "/eval run <index_name> [--questions <path>] [--top-k N]")
+        pos, flags = parse_args(rest)
+        return _cmd_eval_run(app, pos[0], flags)
+    if sub == "report":
+        _require_positional(rest, 1, "/eval report <result_file> [--format ...]")
+        pos, flags = parse_args(rest)
+        return _cmd_eval_report(app, pos[0], flags)
+    raise ValueError(f"Неизвестная подкоманда /eval: {sub!r}. Доступно: generate, run, report")
+
+
+def _cmd_eval_generate(app: App, args: List[str]) -> str:
+    _pos, flags = parse_args(args)
+    index_name = _resolve_index(app.config, flags)
+    count = int(flags.get("count", 10))
+    out = flags.get("out") or app.config.get("evaluation.questions", "data/eval/questions.yaml")
+    force = bool(flags.get("force"))
+
+    llm = _make_llm(app.config)
+    questions = generate_questions(app.store, llm, index_name, count=count)
+
+    out_path = Path(out)
+    if out_path.exists() and not force:
+        out_path = out_path.with_name(f"{out_path.stem}.generated.yaml")
+        print(
+            f"ПРЕДУПРЕЖДЕНИЕ: файл '{out}' уже существует. "
+            f"Сохраняю в '{out_path}' (используйте --force для перезаписи)."
+        )
+    save_questions(questions, out_path)
+
+    return f"Сгенерировано {len(questions)} вопросов и сохранено в: {out_path}\n\n{_render_questions_short(questions)}"
+
+
+def _cmd_eval_run(app: App, index_name: str, flags: dict) -> str:
+    questions_path = flags.get("questions") or app.config.get("evaluation.questions", "data/eval/questions.yaml")
+    top_k = int(flags["top-k"]) if flags.get("top-k") else None
+
+    questions = load_questions(questions_path)
+    if not questions:
+        raise ValueError(f"В '{questions_path}' нет вопросов.")
+
+    llm = _make_llm(app.config)
+    rag = RAGPipeline(_make_retriever(app, index_name), llm, app.config)
+    no_rag = NoRAGPipeline(llm, app.config)
+
+    results = run_evaluation(questions, rag, no_rag, top_k=top_k)
+    results_dir = app.config.resolve_path(app.config.get("evaluation.results_dir", "data/eval/results"))
+    json_path, md_path, payload = save_results(results, results_dir, index_name=index_name, top_k=top_k)
+
+    return render_report(payload, "console") + f"\n\nСохранено:\n  {json_path}\n  {md_path}"
+
+
+def _cmd_eval_report(app: App, result_file: str, flags: dict) -> str:
+    fmt = flags.get("format") or "console"
+    if fmt not in REPORT_FORMAT_CHOICES:
+        raise ValueError(f"Неизвестный формат: {fmt!r}. Доступно: {', '.join(REPORT_FORMAT_CHOICES)}")
+    return render_report_file(result_file, fmt)
+
+
+# ---------------------------------------------------------------------- #
 # Диспетчер и точка входа
 # ---------------------------------------------------------------------- #
 def handle_command(line: str, app: App) -> Tuple[bool, str]:
@@ -274,6 +470,14 @@ def handle_command(line: str, app: App) -> Tuple[bool, str]:
         return False, _cmd_debug(app, args)
     if cmd == "/index":
         return False, _cmd_index(app, args)
+    if cmd == "/ask":
+        return False, _cmd_ask(app, args)
+    if cmd == "/ask-raw":
+        return False, _cmd_ask_raw(app, args)
+    if cmd == "/ask-compare":
+        return False, _cmd_ask_compare(app, args)
+    if cmd == "/eval":
+        return False, _cmd_eval(app, args)
 
     return False, f"Неизвестная команда: {cmd!r}. Введите /help для списка команд."
 

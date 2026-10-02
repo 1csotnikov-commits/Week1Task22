@@ -4,6 +4,7 @@ transformers>=4.40,<5.0
 einops
 numpy
 PyYAML
+openai
 
 # Опционально: FAISS для быстрого поиска по косинусной близости.
 # Если faiss-cpu не устанавливается на Windows Server 2022 / Python 3.12,

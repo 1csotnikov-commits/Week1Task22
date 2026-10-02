@@ -18,7 +18,7 @@ class IndexStore(ABC):
     """
 
     @abstractmethod
-    def begin(self, index_name: str, strategy: str, model: str, provider: str, dim: int) -> None:
+    def begin(self, index_name: str, strategy: str, model: str, provider: str, dim: int, embedding_format: str = "") -> None:
         """Начать построение нового индекса."""
 
     @abstractmethod

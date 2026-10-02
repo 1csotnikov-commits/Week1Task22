@@ -1,12 +1,15 @@
-# Week1Task21 — Локальный пайплайн индексации документов
+# Week1Task22 — Первый RAG-запрос
 
-Локальный пайплайн индексации русскоязычных документов:
+Расширение проекта Week1Task21: локальный пайплайн индексации + RAG-агент.
 
-1. Загрузка текстовых документов (`.md`, `.txt`, `.py`, `.js`, `.json` и т.п.);
-2. Чанкинг двумя стратегиями — `fixed_size` и `structural`;
-3. Генерация эмбеддингов локальной моделью `nomic-ai/nomic-embed-text-v2-moe`;
-4. Сохранение индекса в **FAISS + SQLite**;
-5. Вывод статистики для сравнения стратегий чанкинга.
+Папка проекта — `C:\II\Week 1 Task 21` (продолжение Task 21, публикация в отдельный репозиторий Week1Task22).
+
+Возможности:
+
+1. Индексация документов (Task 21): загрузка, чанкинг (`fixed_size` / `structural`), эмбеддинги `nomic-ai/nomic-embed-text-v2-moe`, FAISS + SQLite, статистика;
+2. RAG-запрос (Task 22): вопрос → поиск релевантных чанков → промт → DeepSeek → ответ;
+3. Два режима: ответ LLM **с RAG** и **без RAG**;
+4. Контрольные вопросы (`questions.yaml`) и сравнение качества (эвристики, без LLM-as-judge).
 
 Интерфейс — только CLI (интерактивный REPL), без web. PDF не поддерживаются.
 
@@ -23,19 +26,24 @@
 ```
 C:\II\Week 1 Task 21\
 ├── config/
-│   └── config.yaml          # конфигурация (эмбеддинги, чанкинг, пути)
+│   └── config.yaml          # конфигурация (embedding, chunking, index, llm, rag, evaluation)
 ├── data/
 │   ├── documents/           # пользователь кладёт сюда документы
-│   └── index/               # сгенерированные индексы (faiss.index + metadata.db)
+│   ├── index/               # сгенерированные индексы (faiss.index + metadata.db)
+│   ├── eval/                # контрольные вопросы (questions.yaml) и результаты
+│   └── logs/                # логи RAG-запросов (опционально)
 ├── src/
 │   ├── ingestion/           # DocumentLoader: text_loader (.md/.txt/.py/.js/.json)
 │   ├── chunking/            # BaseChunker, fixed_size, structural
 │   ├── embeddings/          # EmbeddingProvider, nomic_provider
 │   ├── indexing/            # IndexStore, faiss_sqlite_store, pipeline
 │   ├── stats/               # chunk_stats (метрики + форматы console/json/csv/markdown)
-│   ├── retrieval/           # заглушка (задел на День 22)
+│   ├── llm/                 # LLMProvider, deepseek_provider
+│   ├── retrieval/           # Retriever, VectorRetriever, RetrievedChunk
 │   ├── reranking/           # заглушка (задел на День 23)
-│   ├── rag/                 # заглушка (задел на День 24)
+│   ├── rag/                 # RAGPipeline, NoRAGPipeline, prompt_builder, citations (заглушка)
+│   ├── evaluation/          # вопросы, генерация, прогон, эвристики, отчёты
+│   ├── chat/                # заглушка (задел на День 25)
 │   └── cli/                 # main.py (REPL), commands.py (единый источник описаний)
 ├── tests/                   # unittest-тесты
 ├── requirements.txt
@@ -107,6 +115,12 @@ python -m src.cli.main
 | `/index show-chunk <name> <chunk_id>` | Полный текст + метаданные чанка |
 | `/index list-chunks <name> [--source ...] [--section ...] [--limit N]` | Список чанков с фильтрами |
 | `/index delete <name>` | Удалить индекс |
+| `/ask "<вопрос>" [--index <name>] [--top-k N] [--debug]` | RAG-ответ + источники |
+| `/ask-raw "<вопрос>" [--debug]` | Ответ LLM без RAG |
+| `/ask-compare "<вопрос>" [--index <name>] [--top-k N]` | Оба режима рядом |
+| `/eval generate [--index <name>] [--count N] [--out <path>] [--force]` | Генерация контрольных вопросов |
+| `/eval run <index_name> [--questions <path>] [--top-k N]` | Прогон вопросов в двух режимах |
+| `/eval report <result_file> [--format console\|markdown\|json]` | Сравнительный отчёт |
 | `/debug on\|off` | Отладочный режим (показывает эмбеддинги и стектрейсы) |
 | `/exit` | Выход |
 
@@ -196,12 +210,102 @@ python -m unittest discover -s tests -t .
 
 Покрытие: загрузка документов, `fixed_size`, `structural`, эмбеддинги
 (размерность 768 и нормализация; пропускается, если модель недоступна),
-сохранение/загрузка FAISS + SQLite, статистика, CLI-команды.
+сохранение/загрузка FAISS + SQLite, статистика, retrieval, RAG-пайплайн,
+LLM-провайдер (мок), evaluation, CLI-команды.
 
-## Задел на Дни 22–24
+## RAG-пайплайн (Task 22)
 
-- `src/retrieval` — `search(query, top_k) -> List[ChunkWithScore]`;
-- `src/reranking` — `rerank(chunks, query) -> List[ChunkWithScore]`;
-- `src/rag` — `build_prompt(question, chunks) -> str`, `extract_citations(answer, chunks) -> List[Citation]`.
+Первый RAG-запрос: `вопрос → retrieval → prompt → LLM → ответ`.
+
+```
+вопрос → retrieval (поиск top-k чанков в FAISS) → сборка промта → DeepSeek → ответ (+ источники)
+```
+
+### Формат эмбеддингов
+
+Модель `nomic-embed-text-v2-moe` различает типы задач префиксами:
+
+- при индексации документов: `search_document: <текст чанка>`;
+- при поиске (запрос пользователя): `search_query: <запрос>`.
+
+В Task 21 префиксы не применялись. В Task 22 формат приведён к единому:
+
+- `/index build` добавляет префикс `search_document:` при расчёте эмбеддингов;
+- retrieval всегда эмбеддит запрос с префиксом `search_query:`;
+- формат сохраняется в индексе (поле `embedding_format` в SQLite).
+
+Если индекс создан без префиксов (старый индекс Task 21) — при поиске выводится
+предупреждение и предложение переиндексировать через `/index build`.
+
+### LLM-провайдер (DeepSeek)
+
+- Модель `deepseek-chat`, endpoint `https://api.deepseek.com`;
+- ключ — из переменной окружения `DEEPSEEK_API_KEY` (в коде не хранится);
+- установка ключа (PowerShell): `$env:DEEPSEEK_API_KEY="sk-..."`;
+- при отсутствии ключа — понятная ошибка с инструкцией.
+
+### Команды запросов
+
+```bash
+> /ask "Какие стратегии чанкинга есть?" --index my_index --top-k 5
+> /ask-raw "Что такое эмбеддинг?"
+> /ask-compare "Какая модель эмбеддингов используется?" --index my_index
+```
+
+`/ask` выводит ответ и список источников (source, section, chunk_id, score).
+При `/debug on` (или флаге `--debug`) — полный промт и все использованные чанки.
+
+### Контрольные вопросы (questions.yaml)
+
+Файл `data/eval/questions.yaml` — 10 вопросов с ожиданиями и источниками.
+
+```yaml
+questions:
+  - id: q01
+    question: "Какие две стратегии чанкинга поддерживает пайплайн?"
+    expected_answer: "fixed_size и structural"
+    expected_sources: ["readme_guide.md"]
+    notes: "раздел 'Стратегии чанкинга'"
+```
+
+Поля: `id`, `question`, `expected_answer`, `expected_sources` (опционально), `notes` (опционально).
+
+### Генерация черновика вопросов
+
+```bash
+> /eval generate --index my_index --count 10
+```
+
+LLM получает выборку чанков (разные source/section) и формирует вопросы.
+Если `data/eval/questions.yaml` уже существует и нет `--force` — результат пишется
+в `data/eval/questions.generated.yaml`, чтобы не перезаписать ручные правки.
+
+### Прогон и сравнение режимов
+
+```bash
+> /eval run my_index --top-k 5
+> /eval report data/eval/results/20260101-120000.json --format console
+```
+
+`/eval run` прогоняет каждый вопрос в двух режимах (RAG и No-RAG) и сохраняет
+результаты в `data/eval/results/<timestamp>.json` и `.md`.
+
+### Эвристики сравнения (без LLM-as-judge)
+
+Грубая автоматическая оценка (точное сравнение — вручную):
+
+- **keyword_overlap** — пересечение ключевых слов (без стоп-слов) ответа и ожидания;
+- **substring_match** — вхождение `expected_answer` как подстроки в ответе;
+- **jaccard** — коэффициент Жаккара по множествам токенов;
+- **hit** — «попал», если `substring_match` ИЛИ `keyword_overlap >= 0.5`;
+- **source hit** (RAG) — пересечение `source`/`source#section` использованных чанков с `expected_sources`;
+- сводка — hit rate RAG/No-RAG, среднее время, средние токены.
+
+## Задел на Дни 23–25
+
+- `src/reranking` — `rerank(chunks, query)` (День 23);
+- `src/rag/citations.py` — `extract_citations(answer, chunks)` (День 24);
+- `src/chat` — мини-чат с историей и памятью (День 25).
 
 Модули — заглушки с интерфейсами, которые заполняются логикой на следующих этапах.
+

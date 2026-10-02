@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 from src.chunking import make_chunker
 from src.config import Config
-from src.embeddings.base import EmbeddingProvider
+from src.embeddings.base import EMBEDDING_FORMAT_VERSION, SEARCH_DOCUMENT_PREFIX, EmbeddingProvider
 from src.embeddings.nomic_provider import NomicProvider
 from src.indexing.faiss_sqlite_store import FAISSSQLiteStore
 from src.ingestion.text_loader import TextDocumentLoader
@@ -58,7 +58,8 @@ def build_index(
 
     texts = [c.text for c in chunks]
     print(f"Генерация эмбеддингов для {len(texts)} чанков...")
-    embeddings = provider.encode(texts)
+    # Эмбеддинги считаются с префиксом search_document: (требование nomic-embed-text-v2-moe).
+    embeddings = provider.encode([SEARCH_DOCUMENT_PREFIX + t for t in texts])
 
     store = FAISSSQLiteStore(config.index_path)
     store.begin(
@@ -67,6 +68,7 @@ def build_index(
         model=config.embedding_model,
         provider=config.embedding_provider,
         dim=int(embeddings.shape[1]),
+        embedding_format=EMBEDDING_FORMAT_VERSION,
     )
     for doc in documents:
         store.add_document(doc)

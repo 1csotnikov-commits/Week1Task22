@@ -48,6 +48,7 @@ class FAISSSQLiteStore(IndexStore):
         self._dim = 0
         self._num_documents = 0
         self._started = 0.0
+        self._embedding_format = ""
 
     # ------------------------------------------------------------------ #
     # Пути
@@ -67,7 +68,7 @@ class FAISSSQLiteStore(IndexStore):
     # ------------------------------------------------------------------ #
     # Построение индекса
     # ------------------------------------------------------------------ #
-    def begin(self, index_name: str, strategy: str, model: str, provider: str, dim: int) -> None:
+    def begin(self, index_name: str, strategy: str, model: str, provider: str, dim: int, embedding_format: str = "") -> None:
         if HAS_FAISS:
             print("Используется FAISS IndexFlatIP (inner product = косинусная близость).")
         else:
@@ -81,6 +82,7 @@ class FAISSSQLiteStore(IndexStore):
         self._model = model
         self._provider = provider
         self._dim = dim
+        self._embedding_format = embedding_format
         self._num_documents = 0
         self._chunk_ids = []
         self._started = time.time()
@@ -114,8 +116,8 @@ class FAISSSQLiteStore(IndexStore):
             raise RuntimeError("finalize вызван до begin()")
 
         self._exec(
-            "INSERT OR REPLACE INTO indices (name, strategy, model, provider, dim, store_type, num_documents, num_chunks, indexing_time_seconds, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO indices (name, strategy, model, provider, dim, store_type, num_documents, num_chunks, indexing_time_seconds, created_at, embedding_format) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._index_name,
                 self._strategy,
@@ -127,6 +129,7 @@ class FAISSSQLiteStore(IndexStore):
                 len(self._chunk_ids),
                 round(time.time() - self._started, 4),
                 _now_iso(),
+                self._embedding_format,
             ),
         )
         self._db.commit()
@@ -202,7 +205,8 @@ class FAISSSQLiteStore(IndexStore):
                 num_documents INTEGER,
                 num_chunks INTEGER,
                 indexing_time_seconds REAL,
-                created_at TEXT
+                created_at TEXT,
+                embedding_format TEXT
             )
             """
         )
@@ -295,6 +299,7 @@ class FAISSSQLiteStore(IndexStore):
         row = self._fetchone("SELECT strategy, model, provider, dim FROM indices WHERE name = ?", (index_name,))
         if row:
             self._strategy, self._model, self._provider, self._dim = row
+        self._embedding_format = self._read_embedding_format(index_name)
 
     def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[ChunkWithScore]:
         if self._index_name is None:
@@ -383,6 +388,18 @@ class FAISSSQLiteStore(IndexStore):
         rows = self._fetchall("SELECT chunk_id FROM chunks ORDER BY id")
         return [r[0] for r in rows]
 
+    @property
+    def embedding_format(self) -> str:
+        """Формат эмбеддингов загруженного/построенного индекса ('' для старых индексов)."""
+        return self._embedding_format
+
+    def _read_embedding_format(self, index_name: str) -> str:
+        try:
+            row = self._fetchone("SELECT embedding_format FROM indices WHERE name = ?", (index_name,))
+        except sqlite3.OperationalError:
+            return ""
+        return (row[0] if row and row[0] else "")
+
     def info(self, index_name: str) -> dict:
         db_path = self._db_path(index_name)
         if not db_path.exists():
@@ -390,11 +407,20 @@ class FAISSSQLiteStore(IndexStore):
 
         conn = sqlite3.connect(str(db_path))
         try:
-            row = conn.execute(
-                "SELECT name, strategy, model, provider, dim, store_type, num_documents, num_chunks, indexing_time_seconds, created_at "
-                "FROM indices WHERE name = ?",
-                (index_name,),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT name, strategy, model, provider, dim, store_type, num_documents, num_chunks, indexing_time_seconds, created_at, embedding_format "
+                    "FROM indices WHERE name = ?",
+                    (index_name,),
+                ).fetchone()
+                has_format = True
+            except sqlite3.OperationalError:
+                row = conn.execute(
+                    "SELECT name, strategy, model, provider, dim, store_type, num_documents, num_chunks, indexing_time_seconds, created_at "
+                    "FROM indices WHERE name = ?",
+                    (index_name,),
+                ).fetchone()
+                has_format = False
             num_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             num_documents = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         finally:
@@ -412,6 +438,7 @@ class FAISSSQLiteStore(IndexStore):
             "num_chunks": num_chunks,
             "indexing_time_seconds": 0.0,
             "created_at": "",
+            "embedding_format": "",
         }
         if row:
             info.update({
@@ -425,6 +452,7 @@ class FAISSSQLiteStore(IndexStore):
                 "num_chunks": row[7] or num_chunks,
                 "indexing_time_seconds": row[8] or 0.0,
                 "created_at": row[9] or "",
+                "embedding_format": (row[10] if has_format and row[10] else ""),
             })
         return info
 
